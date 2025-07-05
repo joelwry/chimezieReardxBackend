@@ -1,6 +1,6 @@
-from rest_framework import viewsets,status 
-from .models import Activity, Payment, SurveyTask,CustomUser, Transaction, Reward
-from .serializers import ActivitySerializer, PaymentSerializer, SurveyTaskSerializer, CustomUserSerializer, TransactionSerializer, DashboardSerializer, RewardSerializer
+from rest_framework import viewsets, status, serializers
+from .models import Activity, Payment, SurveyTask,CustomUser, Transaction, Reward, DailyGrowthRate, DailyGrowth, Withdrawal
+from .serializers import ActivitySerializer, PaymentSerializer, SurveyTaskSerializer, CustomUserSerializer, TransactionSerializer, DashboardSerializer, RewardSerializer, DailyGrowthRateSerializer, DailyGrowthSerializer, WithdrawalSerializer
 from rest_framework.permissions import IsAuthenticated,IsAuthenticatedOrReadOnly,AllowAny
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -12,8 +12,16 @@ from datetime import timedelta
 import requests
 import json
 from decimal import Decimal
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, action
 
+from decouple import config
+
+# Your receiving wallet address (must match the network)
+TRON_RECEIVER_ADDRESS = config("TRON_RECEIVER_ADDRESS")
+# Optional but recommended: API key from TronGrid.io
+TRONGRID_API_KEY = config("TRONGRID_API_KEY", default=None)
+TRON_NODE=config("TRON_NODE")
+TRON_USDT_ADDRESS = config("TRON_USDT_CONTRACT_ADDRESS")
 
 class CustomUserViewSet(viewsets.ReadOnlyModelViewSet):
     '''
@@ -47,6 +55,7 @@ class ActivityViewSet(viewsets.ModelViewSet):
         task_id = self.request.query_params.get('task')
         if task_id:
             queryset = queryset.filter(task__id=task_id)
+        print(list(queryset))
         return queryset
 
     def perform_create(self, serializer):
@@ -377,7 +386,7 @@ class VerifyDepositAPIView(APIView):
                 return Response({
                     "error": "Transaction not yet confirmed"
                 }, status=status.HTTP_400_BAD_REQUEST)
-            
+          
             # Verify it's a USDT transfer to our address
             contract_address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # USDT contract on Tron
             our_address = "YOUR_TRON_USDT_ADDRESS"  # Your wallet address
@@ -459,3 +468,131 @@ class RewardTransferAPIView(APIView):
             "amount": float(amount),
             "new_balance": float(user.balance)
         })
+
+# --- Daily Growth Rate ViewSet ---
+class DailyGrowthRateViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = DailyGrowthRate.objects.all()
+    serializer_class = DailyGrowthRateSerializer
+    permission_classes = [IsAuthenticatedOrReadOnly]
+
+# --- Daily Growth ViewSet ---
+class DailyGrowthViewSet(viewsets.ModelViewSet):
+    serializer_class = DailyGrowthSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = DailyGrowth.objects.filter(user=self.request.user)
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        return queryset.order_by('-activated_date')
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        plan_id = self.request.data.get('plan_id')
+        amount = self.request.data.get('amount')
+        
+        if not plan_id or not amount:
+            raise serializers.ValidationError({'detail': 'Plan and amount are required.'})
+        
+        try:
+            plan = DailyGrowthRate.objects.get(id=plan_id)
+        except DailyGrowthRate.DoesNotExist:
+            raise serializers.ValidationError({'detail': 'Selected plan does not exist.'})
+        
+        amount = float(amount)
+        if amount < float(plan.min_amount) or amount > float(plan.max_amount):
+            raise serializers.ValidationError({'detail': f'Amount must be between {plan.min_amount} and {plan.max_amount} for this plan.'})
+        
+        if user.balance < amount:
+            raise serializers.ValidationError({'detail': 'Insufficient wallet balance.'})
+        
+        # Deduct from user balance
+        user.balance -= Decimal(str(amount))
+        user.save()
+        
+        # Save the daily growth
+        serializer.save(user=user, plan=plan, rate=plan.rate, amount=amount, activated_date=timezone.now())
+        
+        # Create transaction
+        Transaction.objects.create(
+            customer=user,
+            type='invest',
+            amount=amount,
+            reference=f"Daily Growth Investment ({plan.name})"
+        )
+
+    @action(detail=True, methods=['post'])
+    def claim(self, request, pk=None):
+        user = request.user
+        try:
+            growth = DailyGrowth.objects.get(pk=pk, user=user, status='active')
+        except DailyGrowth.DoesNotExist:
+            return Response({'detail': 'Active daily growth not found.'}, status=404)
+        
+        # Check if 30 days have passed since investment
+        days_since_investment = (timezone.now().date() - growth.activated_date.date()).days
+        if days_since_investment < 30:
+            remaining_days = 30 - days_since_investment
+            return Response({
+                'detail': f'You can only claim after 30 days from investment. You have {remaining_days} days remaining.'
+            }, status=400)
+        
+        grown_amount = growth.grown_amount()
+        # Credit grown amount to user wallet
+        user.balance += Decimal(str(grown_amount))
+        user.save()
+        # Mark as claimed
+        growth.status = 'claimed'
+        growth.claimed_date = timezone.now()
+        growth.save()
+        # Create transaction
+        Transaction.objects.create(
+            customer=user,
+            type='return',
+            amount=grown_amount,
+            reference=f"Claimed Daily Growth ({growth.plan.name})"
+        )
+        return Response({
+            'message': 'Daily growth claimed successfully.',
+            'amount': round(grown_amount, 2),
+            'new_balance': float(user.balance)
+        })
+
+# --- Withdrawal ViewSet ---
+class WithdrawalViewSet(viewsets.ModelViewSet):
+    serializer_class = WithdrawalSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return Withdrawal.objects.filter(user=self.request.user).order_by('-created_at')
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        user = request.user
+        amount = serializer.validated_data['amount']
+        
+        if user.balance < amount:
+            raise serializers.ValidationError({'detail': 'Insufficient wallet balance.'})
+        
+        # Deduct from user balance
+        user.balance -= Decimal(str(amount))
+        user.save()
+        
+        # Create withdrawal record
+        withdrawal = serializer.save(user=user)
+        
+        # Create transaction record
+        Transaction.objects.create(
+            customer=user,
+            type='withdrawal',
+            amount=amount,
+            reference=f"Withdrawal request - {withdrawal.id}"
+        )
+        
+        return Response({
+            'message': 'Withdrawal request submitted successfully.',
+            'new_balance': float(user.balance)
+        }, status=status.HTTP_201_CREATED)

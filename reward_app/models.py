@@ -82,7 +82,8 @@ class Transaction(models.Model):
         ('lock', 'Lock'),           # NEW: When user locks money
         ('unlock', 'Unlock'),       # NEW: When lock period ends
         ('invest', 'Invest'),       # NEW: When user invests
-        ('return', 'Return')        # NEW: When investment returns
+        ('return', 'Return'),       # NEW: When investment returns
+        ('reward_claim', 'Reward Claim')  # NEW: When user transfers reward to balance
     ]
 
     customer = models.ForeignKey(CustomUser, on_delete=models.CASCADE)
@@ -100,4 +101,62 @@ class Reward(models.Model):
 
     def __str__(self):
         return f"{self.user.username} - Reward: {self.total_reward}"
+
+# --- Daily Growth Investment Models ---
+class DailyGrowthRate(models.Model):
+    name = models.CharField(max_length=100)
+    min_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    max_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    rate = models.DecimalField(max_digits=5, decimal_places=2, help_text="Daily growth rate as a percentage (e.g. 1.00 for 1%)")
+
+    def __str__(self):
+        return f"{self.name} ({self.rate}% per day)"
+
+class DailyGrowth(models.Model):
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("claimed", "Claimed"),
+    ]
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name="daily_growths")
+    rate = models.DecimalField(max_digits=5, decimal_places=2)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default="active")
+    activated_date = models.DateTimeField()
+    claimed_date = models.DateTimeField(null=True, blank=True)
+    plan = models.ForeignKey(DailyGrowthRate, on_delete=models.PROTECT, related_name="growths")
+
+    def __str__(self):
+        return f"{self.user.username} - {self.amount} @ {self.rate}% - {self.status}"
+
+    def days_active(self):
+        from django.utils import timezone
+        end_date = self.claimed_date if self.status == "claimed" and self.claimed_date else timezone.now()
+        return (end_date.date() - self.activated_date.date()).days
+
+    def grown_amount(self):
+        # Compound daily growth
+        days = self.days_active()
+        return float(self.amount) * ((1 + float(self.rate) / 100) ** days)
+
+# --- Withdrawal Model ---
+class Withdrawal(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('rejected', 'Rejected'),
+    ]
+    
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name="withdrawals")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    bank_name = models.CharField(max_length=100)
+    account_name = models.CharField(max_length=100)
+    account_number = models.CharField(max_length=20)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    admin_notes = models.TextField(blank=True)
+
+    def __str__(self):
+        return f"{self.user.username} - ₦{self.amount} - {self.status}"
 
